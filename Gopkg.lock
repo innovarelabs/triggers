@@ -456,7 +456,7 @@
   version = "v1.0.3"
 
 [[projects]]
-  digest = "1:b07cb7802c839ecd6108a7f36aa5685a0c4c41244faeb310f89e4bbcceeca766"
+  digest = "1:e34ebe43f6ae31bf0eb9cb09d7ba9bbf298a1be5157b95f621b313bd5f6796e1"
   name = "github.com/tektoncd/pipeline"
   packages = [
     "pkg/apis/config",
@@ -467,12 +467,34 @@
     "pkg/client/clientset/versioned/scheme",
     "pkg/client/clientset/versioned/typed/pipeline/v1alpha1",
     "pkg/client/clientset/versioned/typed/pipeline/v1alpha1/fake",
+    "pkg/client/informers/externalversions",
+    "pkg/client/informers/externalversions/internalinterfaces",
+    "pkg/client/informers/externalversions/pipeline",
+    "pkg/client/informers/externalversions/pipeline/v1alpha1",
     "pkg/client/injection/client",
     "pkg/client/injection/client/fake",
+    "pkg/client/injection/informers/pipeline/factory",
+    "pkg/client/injection/informers/pipeline/factory/fake",
+    "pkg/client/injection/informers/pipeline/v1alpha1/clustertask",
+    "pkg/client/injection/informers/pipeline/v1alpha1/clustertask/fake",
+    "pkg/client/injection/informers/pipeline/v1alpha1/condition",
+    "pkg/client/injection/informers/pipeline/v1alpha1/condition/fake",
+    "pkg/client/injection/informers/pipeline/v1alpha1/pipeline",
+    "pkg/client/injection/informers/pipeline/v1alpha1/pipeline/fake",
+    "pkg/client/injection/informers/pipeline/v1alpha1/pipelineresource",
+    "pkg/client/injection/informers/pipeline/v1alpha1/pipelineresource/fake",
+    "pkg/client/injection/informers/pipeline/v1alpha1/pipelinerun",
+    "pkg/client/injection/informers/pipeline/v1alpha1/pipelinerun/fake",
+    "pkg/client/injection/informers/pipeline/v1alpha1/task",
+    "pkg/client/injection/informers/pipeline/v1alpha1/task/fake",
+    "pkg/client/injection/informers/pipeline/v1alpha1/taskrun",
+    "pkg/client/injection/informers/pipeline/v1alpha1/taskrun/fake",
+    "pkg/client/listers/pipeline/v1alpha1",
     "pkg/list",
     "pkg/logging",
     "pkg/names",
     "pkg/system",
+    "test",
   ]
   pruneopts = "NUT"
   revision = "c105b6835a899ad1cccadc3556c8a260e812d2cf"
@@ -563,7 +585,7 @@
   version = "v1.1.0"
 
 [[projects]]
-  digest = "1:5ab79d2a36037de1ab2908733a2cab0c08b12f6956e3e1eab07cd1b2abf7b903"
+  digest = "1:6463628b4e2c5680bf069a15bf109ee6dd8ffc54e20447a23639167128c2c4ed"
   name = "go.uber.org/zap"
   packages = [
     ".",
@@ -574,6 +596,7 @@
     "internal/ztest",
     "zapcore",
     "zaptest",
+    "zaptest/observer",
   ]
   pruneopts = "NUT"
   revision = "67bc79d13d155c02fd008f721863ff8cc5f30659"
@@ -1205,6 +1228,8 @@
     "injection/clients/kubeclient/fake",
     "injection/informers/kubeinformers/appsv1/deployment",
     "injection/informers/kubeinformers/appsv1/deployment/fake",
+    "injection/informers/kubeinformers/corev1/pod",
+    "injection/informers/kubeinformers/corev1/pod/fake",
     "injection/informers/kubeinformers/corev1/service",
     "injection/informers/kubeinformers/corev1/service/fake",
     "injection/informers/kubeinformers/factory",
@@ -1249,10 +1274,14 @@
     "github.com/tektoncd/pipeline/pkg/logging",
     "github.com/tektoncd/pipeline/pkg/names",
     "github.com/tektoncd/pipeline/pkg/system",
+    "github.com/tektoncd/pipeline/test",
     "github.com/tektoncd/plumbing/scripts",
     "github.com/tidwall/gjson",
     "github.com/tidwall/sjson",
+    "go.opencensus.io/trace",
     "go.uber.org/zap",
+    "golang.org/x/net/context",
+    "golang.org/x/oauth2",
     "golang.org/x/xerrors",
     "gopkg.in/yaml.v2",
     "k8s.io/api/apps/v1",

@@ -21,8 +21,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1alpha1"
+	"go.opencensus.io/trace"
+	"k8s.io/apimachinery/pkg/util/wait"
+
 	"io/ioutil"
-	"k8s.io/apimachinery/pkg/watch"
+
+	"time"
+
 	"net/http"
 	"path"
 	"sort"
@@ -54,6 +59,9 @@ import (
 )
 
 const (
+	interval = 1 * time.Second
+	timeout  = 10 * time.Minute
+
 	PipelineLabelInjectedKey  = "app"
 	GithubAccessTokenSecretKey = "accessToken"
 	RepoStatusPending = "pending"
@@ -100,6 +108,7 @@ func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 
 	result := make(chan int, 10)
 	// Execute each Trigger
+	pipelineRun := &v1alpha1.PipelineRun{}
 	var repoName, orgName, commitSha string
 	for _, t := range el.Spec.Triggers {
 		log := eventLog.With(zap.String(triggersv1.TriggerLabelKey, t.Name))
@@ -140,10 +149,10 @@ func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 			pipeline, err := r.PipelineClient.TektonV1alpha1().Pipelines(
 				r.EventListenerNamespace).Get(getPipelineNameFromTriggerTemplate(rt.TriggerTemplate),
 					metav1.GetOptions{})
-
+			accessToken := getAccessToken(r.KubeClientSet,el, r.EventListenerNamespace, log)
 			github.PostGithubStatusChecks(
 				context.Background(),
-				getAccessToken(r.KubeClientSet,el, r.EventListenerNamespace, log),
+				accessToken,
 				RepoStatusPending,
 				orgName, repoName, commitSha,
 				getPipelineTasks(pipeline), log)
@@ -156,13 +165,17 @@ func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 			}
 			log.Info("params: %+v", params)
 			resources := template.ResolveResources(rt.TriggerTemplate, params)
-			res, err := r.createResources(resources, t.Name, eventID)
+			res, err := r.createResources(resources, t.Name, eventID, repoName)
 			if  err != nil {
 				log.Error(err)
 			}
 			result <- http.StatusCreated
 			a, err := res.Raw()
-			fmt.Printf("res.Raw() ==============> %v\n", string(a))
+			err = json.Unmarshal(a, pipelineRun)
+			//fmt.Printf("===========> %v\n",PipelineRunSucceed(pipelineRun.Name))
+
+			waitForPipelineState(context.Background(), &r, pipelineRun.Name, accessToken,
+				orgName, repoName, commitSha, log)
 		}(t)
 	}
 
@@ -175,20 +188,18 @@ func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 			code = thiscode
 		}
 	}
-	/////////
-	watch := make(chan watch.Interface)
-	w, err := r.PipelineClient.TektonV1alpha1().PipelineRuns(r.EventListenerNamespace).Watch(metav1.ListOptions{})
-	watch <- w
-	/////////
+
+
+
 	// TODO: Do we really need to return the entire body back???
 	response.WriteHeader(code)
 	//fmt.Fprintf(response, "EventListener: %s in Namespace: %s handling event (EventID: %s) with payload: %s and header: %v",
 	//	r.EventListenerName, r.EventListenerNamespace, string(eventID), string(event), request.Header)
 }
 
-func (r Sink) createResources(resources []json.RawMessage, triggerName, eventID string) (result *restclient.Result, err error) {
+func (r Sink) createResources(resources []json.RawMessage, triggerName, eventID, appLabelName string) (result *restclient.Result, err error) {
 	for _, resource := range resources {
-		if result, err = r.createResource(resource, triggerName, eventID); err != nil {
+		if result, err = r.createResource(resource, triggerName, eventID, appLabelName); err != nil {
 			return nil, err
 		}
 	}
@@ -197,13 +208,14 @@ func (r Sink) createResources(resources []json.RawMessage, triggerName, eventID 
 
 // createResource uses the kubeClient to create the resource defined in the
 // TriggerResourceTemplate and returns any errors with this process
-func (r Sink) createResource(rt json.RawMessage, triggerName string, eventID string) (*restclient.Result, error) {
+func (r Sink) createResource(rt json.RawMessage, triggerName string, eventID, appLabelName string) (*restclient.Result, error) {
 	// Assume the TriggerResourceTemplate is valid (it has an apiVersion and Kind)
 	apiVersion := gjson.GetBytes(rt, "apiVersion").String()
 	kind := gjson.GetBytes(rt, "kind").String()
 	namespace := gjson.GetBytes(rt, "metadata.namespace").String()
-
-
+	if len(appLabelName) == 0 {
+		appLabelName = "tekton"
+	}
 	// Default the resource creation to the EventListenerNamespace if not found in the resource template
 	if namespace == "" {
 		namespace = r.EventListenerNamespace
@@ -217,7 +229,7 @@ func (r Sink) createResource(rt json.RawMessage, triggerName string, eventID str
 		triggersv1.EventListenerLabelKey: r.EventListenerName,
 		triggersv1.EventIDLabelKey:       eventID,
 		triggersv1.TriggerLabelKey:       triggerName,
-		PipelineLabelInjectedKey  : 	  "nabil",
+		PipelineLabelInjectedKey  : 	  appLabelName,
 	})
 	if err != nil {
 		return nil, err
@@ -332,8 +344,50 @@ func getAccessToken(ki kubernetes.Interface, listener *triggersv1.EventListener,
 func getGithubInfoFromPayload(payload []byte) (repoName , orgName, commitId string){
 	wp := &githubsuites.WebHookPayload{}
 	err := json.Unmarshal(payload, wp)
-	if err == nil {
-		return *wp.Repo.Name, strings.Split(*wp.Repo.FullName, "/")[0], *wp.After
+	fullName := strings.Split(*wp.GetRepo().FullName, "/")
+	if err != nil && (len(fullName)==0 && *wp.After == "") {
+		return "", "", ""
 	}
-	return "", "", ""
+	return fullName[1], fullName[0], *wp.After
 }
+
+func waitForPipelineState(ctx context.Context,r *Sink, prName, accessToken, orgName, repoName, commitSha string, log *zap.SugaredLogger) error{
+	_, span := trace.StartSpan(ctx, "Pipeline Run Status!!!")
+	defer span.End()
+	return wait.PollImmediate(interval, timeout, func() (bool, error) {
+		ret, err := r.PipelineClient.TektonV1alpha1().PipelineRuns(r.EventListenerNamespace).Get(prName, metav1.GetOptions{})
+		if err != nil || len(ret.Status.Conditions) != 0{
+			if ret.Status.Conditions[0].IsTrue(){
+				var tasks []string
+				for _, status := range ret.Status.TaskRuns {
+					tasks = append(tasks, status.PipelineTaskName)
+					fmt.Printf("status PipelineTaskName  ==============> %+v\n", status.PipelineTaskName)
+					fmt.Printf("status Reason ==============> %+v\n", status.Status.Conditions[0].Reason)
+					fmt.Printf("status isTure ==============> %+v\n", status.Status.Conditions[0].IsTrue())
+					fmt.Printf("status isFalse ==============> %+v\n", status.Status.Conditions[0].IsFalse())
+					//ctx context.Context, ghAccessToken, status, orgName, repoName, commitSha string, tasksToRestrict []string
+
+				}
+				// pending, success, error, or failure.
+				_, err = github.SetupGithubStatusCheck(ctx, accessToken, "success", orgName, repoName, commitSha, tasks)
+				//log.Errorf("Error ======> %v\n", err)
+				return true, err
+			}
+		}
+		return false, nil
+	})
+}
+
+//func WaitForTaskRunState(r *Sink, trName string, log *zap.SugaredLogger) error {
+//	metricName := fmt.Sprintf("WaitForTaskRunState/%s", trName)
+//	_, span := trace.StartSpan(context.Background(), metricName)
+//	defer span.End()
+//	s := v1alpha1.TaskRunStatus{}
+//	return wait.PollImmediate(interval, timeout, func() (bool, error) {
+//		ret, err := r.PipelineClient.TektonV1alpha1().TaskRuns(r.EventListenerNamespace).Get(trName, metav1.GetOptions{})
+//		if err != nil || len(ret.Status.Conditions) != 0 {
+//			return true, err
+//		}
+//		return inState(r)
+//	})
+//}

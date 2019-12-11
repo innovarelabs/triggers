@@ -90,6 +90,31 @@ func (w *Interceptor) ExecuteTrigger(payload []byte, request *http.Request, _ *t
 }
 
 func PostGithubStatusChecks(ctx context.Context, ghAccessToken, status, orgName, repoName, commitSha string, tasksToRestrict []string, log *zap.SugaredLogger) {
+	client, err := SetupGithubStatusCheck(ctx,
+		ghAccessToken,
+		status,
+		orgName, repoName,commitSha,
+		tasksToRestrict)
+	if err != nil {
+		log.Errorf("err ======> %+v\n", err)
+		return
+	}
+	protectionRequest := &gh.ProtectionRequest{
+		RequiredStatusChecks: &gh.RequiredStatusChecks{
+			Strict:   true,
+			Contexts: tasksToRestrict,
+		},
+		RequiredPullRequestReviews: nil,
+		EnforceAdmins:              false,
+		Restrictions:               nil,
+	}
+	_, _, err = client.Repositories.UpdateBranchProtection(context.Background(), orgName, repoName, GithubBranchToProtect, protectionRequest)
+	if err != nil {
+		log.Errorf("err ======> %+v\n", err)
+	}
+}
+
+func SetupGithubStatusCheck(ctx context.Context, ghAccessToken, status, orgName, repoName, commitSha string, tasksToRestrict []string) (*gh.Client, error){
 	ts := oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: ghAccessToken},
 	)
@@ -103,20 +128,8 @@ func PostGithubStatusChecks(ctx context.Context, ghAccessToken, status, orgName,
 		//TODO - Need to add check if the value are empty
 		_, _, err := client.Repositories.CreateStatus(ctx, orgName, repoName, commitSha, rs)
 		if err != nil {
-			log.Errorf("err ======> %+v\n", err)
+			return nil, err
 		}
 	}
-	protectionRequest := &gh.ProtectionRequest{
-		RequiredStatusChecks: &gh.RequiredStatusChecks{
-			Strict:   true,
-			Contexts: tasksToRestrict,
-		},
-		RequiredPullRequestReviews: nil,
-		EnforceAdmins:              false,
-		Restrictions:               nil,
-	}
-	_, _, err := client.Repositories.UpdateBranchProtection(context.Background(), orgName, repoName, GithubBranchToProtect, protectionRequest)
-	if err != nil {
-		log.Errorf("err ======> %+v\n", err)
-	}
+	return client, nil
 }
