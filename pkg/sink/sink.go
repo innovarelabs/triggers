@@ -21,8 +21,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1alpha1"
-	"golang.org/x/oauth2"
 	"io/ioutil"
+	"k8s.io/apimachinery/pkg/watch"
 	"net/http"
 	"path"
 	"sort"
@@ -56,7 +56,10 @@ import (
 const (
 	PipelineLabelInjectedKey  = "app"
 	GithubAccessTokenSecretKey = "accessToken"
-	GithubBranchToProtect = "master"
+	RepoStatusPending = "pending"
+	RepoStatusSuccess = "success"
+	RepoStatusError = "error"
+	RepoStatusFailure = "failure"
 	)
 // Sink defines the sink resource for processing incoming events for the
 // EventListener.
@@ -71,6 +74,7 @@ type Sink struct {
 	EventListenerNamespace string
 	Logger                 *zap.SugaredLogger
 }
+
 
 // HandleEvent processes an incoming HTTP event for the event listener.
 func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
@@ -133,58 +137,17 @@ func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 				return
 			}
 
-
-			///////////////////////////////
 			pipeline, err := r.PipelineClient.TektonV1alpha1().Pipelines(
 				r.EventListenerNamespace).Get(getPipelineNameFromTriggerTemplate(rt.TriggerTemplate),
 					metav1.GetOptions{})
-			//(ctx context.Context, ghAccessToken, status, orgName, repoName, commitSha string, tasksToRestrict []string, log *zap.SugaredLogger)
+
 			github.PostGithubStatusChecks(
 				context.Background(),
 				getAccessToken(r.KubeClientSet,el, r.EventListenerNamespace, log),
-				"pending",
+				RepoStatusPending,
 				orgName, repoName, commitSha,
 				getPipelineTasks(pipeline), log)
-			/*
-			ts := oauth2.StaticTokenSource(
-				&oauth2.Token{AccessToken: getAccessToken(r.KubeClientSet,el, r.EventListenerNamespace, log)},
-			)
-			tc := oauth2.NewClient(context.Background(), ts)
-			client := githubsuites.NewClient(tc)
-			tasksToRestrict := getPipelineTasks(pipeline)
-			for _, taskName := range tasksToRestrict{
-				rs := &githubsuites.RepoStatus{
-					Context: &taskName,
-					State: &[]string{"pending"}[0],
-				}
-				//fmt.Printf("*rs.State =======> %v\n", *rs.State)
-				//fmt.Printf("*rs.Context =======> %v\n", *rs.Context)
-				//TODO - Need to add check if the value are empty
-				_, _, err = client.Repositories.CreateStatus(context.Background(),orgName, repoName, commitSha, rs)
-				if err != nil {
-					log.Errorf("err ======> %+v\n", err)
-				}
-				//fmt.Printf("err =======> %v\n", err)
-				//fmt.Printf("res =======> %v\n", res)
-			}
 
-			protectionRequest := &githubsuites.ProtectionRequest{
-				RequiredStatusChecks: &githubsuites.RequiredStatusChecks{
-					Strict:true,
-					Contexts: tasksToRestrict,
-				},
-				RequiredPullRequestReviews: nil,
-				EnforceAdmins:              false,
-				Restrictions:               nil,
-			}
-			_, _, err = client.Repositories.UpdateBranchProtection(context.Background(),orgName, repoName, GithubBranchToProtect, protectionRequest)
-			if err != nil {
-				log.Errorf("err ======> %+v\n", err)
-			}
-			//fmt.Printf("protectionResp =======> %v\n", protectionResp)
-			//fmt.Printf("err =======> %v\n", err)
-			*/
-			///////////////////////////////
 			params, err := template.ResolveParams(rt.TriggerBindings, finalPayload, request.Header, rt.TriggerTemplate.Spec.Params)
 			if err != nil {
 				//log.Errorf("err ======> %+v\n", err)
@@ -212,7 +175,11 @@ func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 			code = thiscode
 		}
 	}
-
+	/////////
+	watch := make(chan watch.Interface)
+	w, err := r.PipelineClient.TektonV1alpha1().PipelineRuns(r.EventListenerNamespace).Watch(metav1.ListOptions{})
+	watch <- w
+	/////////
 	// TODO: Do we really need to return the entire body back???
 	response.WriteHeader(code)
 	//fmt.Fprintf(response, "EventListener: %s in Namespace: %s handling event (EventID: %s) with payload: %s and header: %v",
