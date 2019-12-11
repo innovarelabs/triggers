@@ -19,6 +19,8 @@ package github
 import (
 	"errors"
 	"fmt"
+	"golang.org/x/net/context"
+	"golang.org/x/oauth2"
 	"net/http"
 
 	gh "github.com/google/go-github/github"
@@ -29,6 +31,10 @@ import (
 
 	"go.uber.org/zap"
 	"k8s.io/client-go/kubernetes"
+)
+
+const (
+	GithubBranchToProtect = "master"
 )
 
 type Interceptor struct {
@@ -56,6 +62,7 @@ func (w *Interceptor) ExecuteTrigger(payload []byte, request *http.Request, _ *t
 		}
 
 		secretToken, err := interceptors.GetSecretToken(w.KubeClientSet, w.Github.SecretRef, w.EventListenerNamespace)
+
 		if err != nil {
 			return nil, err
 		}
@@ -80,4 +87,36 @@ func (w *Interceptor) ExecuteTrigger(payload []byte, request *http.Request, _ *t
 	}
 
 	return payload, nil
+}
+
+func PostGithubStatusChecks(ctx context.Context, ghAccessToken, status, orgName, repoName, commitSha string, tasksToRestrict []string, log *zap.SugaredLogger) {
+	ts := oauth2.StaticTokenSource(
+		&oauth2.Token{AccessToken: ghAccessToken},
+	)
+	tc := oauth2.NewClient(ctx, ts)
+	client := gh.NewClient(tc)
+	for _, taskName := range tasksToRestrict {
+		rs := &gh.RepoStatus{
+			Context: &taskName,
+			State:   &[]string{status}[0],
+		}
+		//TODO - Need to add check if the value are empty
+		_, _, err := client.Repositories.CreateStatus(ctx, orgName, repoName, commitSha, rs)
+		if err != nil {
+			log.Errorf("err ======> %+v\n", err)
+		}
+	}
+	protectionRequest := &gh.ProtectionRequest{
+		RequiredStatusChecks: &gh.RequiredStatusChecks{
+			Strict:   true,
+			Contexts: tasksToRestrict,
+		},
+		RequiredPullRequestReviews: nil,
+		EnforceAdmins:              false,
+		Restrictions:               nil,
+	}
+	_, _, err := client.Repositories.UpdateBranchProtection(context.Background(), orgName, repoName, GithubBranchToProtect, protectionRequest)
+	if err != nil {
+		log.Errorf("err ======> %+v\n", err)
+	}
 }

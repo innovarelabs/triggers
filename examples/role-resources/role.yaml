@@ -5,7 +5,7 @@ metadata:
 rules:
 # Permissions for every EventListener deployment to function
 - apiGroups: ["tekton.dev"]
-  resources: ["eventlisteners", "triggerbindings", "triggertemplates", "tasks", "taskruns"]
+  resources: ["eventlisteners", "triggerbindings", "triggertemplates", "tasks", "taskruns", "pipelines"]
   verbs: ["get"]
 - apiGroups: [""]
   resources: ["configmaps"]

@@ -17,11 +17,16 @@ limitations under the License.
 package sink
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1alpha1"
+	"golang.org/x/oauth2"
 	"io/ioutil"
 	"net/http"
 	"path"
+	"sort"
+
 	"strings"
 
 	"github.com/tektoncd/triggers/pkg/interceptors/github"
@@ -45,8 +50,14 @@ import (
 	discoveryclient "k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
+	githubsuites "github.com/google/go-github/github"
 )
 
+const (
+	PipelineLabelInjectedKey  = "app"
+	GithubAccessTokenSecretKey = "accessToken"
+	GithubBranchToProtect = "master"
+	)
 // Sink defines the sink resource for processing incoming events for the
 // EventListener.
 type Sink struct {
@@ -64,6 +75,7 @@ type Sink struct {
 // HandleEvent processes an incoming HTTP event for the event listener.
 func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 	el, err := r.TriggersClient.TektonV1alpha1().EventListeners(r.EventListenerNamespace).Get(r.EventListenerName, metav1.GetOptions{})
+
 	if err != nil {
 		r.Logger.Fatalf("Error getting EventListener %s in Namespace %s: %s", r.EventListenerName, r.EventListenerNamespace, err)
 		response.WriteHeader(http.StatusInternalServerError)
@@ -84,7 +96,7 @@ func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 
 	result := make(chan int, 10)
 	// Execute each Trigger
-
+	var repoName, orgName, commitSha string
 	for _, t := range el.Spec.Triggers {
 		log := eventLog.With(zap.String(triggersv1.TriggerLabelKey, t.Name))
 
@@ -103,12 +115,14 @@ func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 			finalPayload := event
 			if interceptor != nil {
 				payload, err := interceptor.ExecuteTrigger(event, request, &t, eventID)
+
 				if err != nil {
 					log.Error(err)
 					result <- http.StatusAccepted
 					return
 				}
 				finalPayload = payload
+				repoName, orgName, commitSha = getGithubInfoFromPayload(finalPayload)
 			}
 			rt, err := template.ResolveTrigger(t,
 				r.TriggersClient.TektonV1alpha1().TriggerBindings(r.EventListenerNamespace).Get,
@@ -119,18 +133,73 @@ func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 				return
 			}
 
+
+			///////////////////////////////
+			pipeline, err := r.PipelineClient.TektonV1alpha1().Pipelines(
+				r.EventListenerNamespace).Get(getPipelineNameFromTriggerTemplate(rt.TriggerTemplate),
+					metav1.GetOptions{})
+			//(ctx context.Context, ghAccessToken, status, orgName, repoName, commitSha string, tasksToRestrict []string, log *zap.SugaredLogger)
+			github.PostGithubStatusChecks(
+				context.Background(),
+				getAccessToken(r.KubeClientSet,el, r.EventListenerNamespace, log),
+				"pending",
+				orgName, repoName, commitSha,
+				getPipelineTasks(pipeline), log)
+			/*
+			ts := oauth2.StaticTokenSource(
+				&oauth2.Token{AccessToken: getAccessToken(r.KubeClientSet,el, r.EventListenerNamespace, log)},
+			)
+			tc := oauth2.NewClient(context.Background(), ts)
+			client := githubsuites.NewClient(tc)
+			tasksToRestrict := getPipelineTasks(pipeline)
+			for _, taskName := range tasksToRestrict{
+				rs := &githubsuites.RepoStatus{
+					Context: &taskName,
+					State: &[]string{"pending"}[0],
+				}
+				//fmt.Printf("*rs.State =======> %v\n", *rs.State)
+				//fmt.Printf("*rs.Context =======> %v\n", *rs.Context)
+				//TODO - Need to add check if the value are empty
+				_, _, err = client.Repositories.CreateStatus(context.Background(),orgName, repoName, commitSha, rs)
+				if err != nil {
+					log.Errorf("err ======> %+v\n", err)
+				}
+				//fmt.Printf("err =======> %v\n", err)
+				//fmt.Printf("res =======> %v\n", res)
+			}
+
+			protectionRequest := &githubsuites.ProtectionRequest{
+				RequiredStatusChecks: &githubsuites.RequiredStatusChecks{
+					Strict:true,
+					Contexts: tasksToRestrict,
+				},
+				RequiredPullRequestReviews: nil,
+				EnforceAdmins:              false,
+				Restrictions:               nil,
+			}
+			_, _, err = client.Repositories.UpdateBranchProtection(context.Background(),orgName, repoName, GithubBranchToProtect, protectionRequest)
+			if err != nil {
+				log.Errorf("err ======> %+v\n", err)
+			}
+			//fmt.Printf("protectionResp =======> %v\n", protectionResp)
+			//fmt.Printf("err =======> %v\n", err)
+			*/
+			///////////////////////////////
 			params, err := template.ResolveParams(rt.TriggerBindings, finalPayload, request.Header, rt.TriggerTemplate.Spec.Params)
 			if err != nil {
-				log.Error(err)
+				//log.Errorf("err ======> %+v\n", err)
 				result <- http.StatusAccepted
 				return
 			}
 			log.Info("params: %+v", params)
 			resources := template.ResolveResources(rt.TriggerTemplate, params)
-			if err := r.createResources(resources, t.Name, eventID); err != nil {
+			res, err := r.createResources(resources, t.Name, eventID)
+			if  err != nil {
 				log.Error(err)
 			}
 			result <- http.StatusCreated
+			a, err := res.Raw()
+			fmt.Printf("res.Raw() ==============> %v\n", string(a))
 		}(t)
 	}
 
@@ -146,42 +215,45 @@ func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 
 	// TODO: Do we really need to return the entire body back???
 	response.WriteHeader(code)
-	fmt.Fprintf(response, "EventListener: %s in Namespace: %s handling event (EventID: %s) with payload: %s and header: %v",
-		r.EventListenerName, r.EventListenerNamespace, string(eventID), string(event), request.Header)
+	//fmt.Fprintf(response, "EventListener: %s in Namespace: %s handling event (EventID: %s) with payload: %s and header: %v",
+	//	r.EventListenerName, r.EventListenerNamespace, string(eventID), string(event), request.Header)
 }
 
-func (r Sink) createResources(resources []json.RawMessage, triggerName, eventID string) error {
+func (r Sink) createResources(resources []json.RawMessage, triggerName, eventID string) (result *restclient.Result, err error) {
 	for _, resource := range resources {
-		if err := r.createResource(resource, triggerName, eventID); err != nil {
-			return err
+		if result, err = r.createResource(resource, triggerName, eventID); err != nil {
+			return nil, err
 		}
 	}
-	return nil
+	return result, nil
 }
 
 // createResource uses the kubeClient to create the resource defined in the
 // TriggerResourceTemplate and returns any errors with this process
-func (r Sink) createResource(rt json.RawMessage, triggerName string, eventID string) error {
+func (r Sink) createResource(rt json.RawMessage, triggerName string, eventID string) (*restclient.Result, error) {
 	// Assume the TriggerResourceTemplate is valid (it has an apiVersion and Kind)
 	apiVersion := gjson.GetBytes(rt, "apiVersion").String()
 	kind := gjson.GetBytes(rt, "kind").String()
 	namespace := gjson.GetBytes(rt, "metadata.namespace").String()
+
+
 	// Default the resource creation to the EventListenerNamespace if not found in the resource template
 	if namespace == "" {
 		namespace = r.EventListenerNamespace
 	}
 	apiResource, err := findAPIResource(r.DiscoveryClient, apiVersion, kind)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	rt, err = addLabels(rt, map[string]string{
 		triggersv1.EventListenerLabelKey: r.EventListenerName,
 		triggersv1.EventIDLabelKey:       eventID,
 		triggersv1.TriggerLabelKey:       triggerName,
+		PipelineLabelInjectedKey  : 	  "nabil",
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	resourcename := gjson.GetBytes(rt, "metadata.name")
@@ -189,20 +261,22 @@ func (r Sink) createResource(rt json.RawMessage, triggerName string, eventID str
 	r.Logger.Infof("Generating resource: kind: %s, name: %s ", resourcekind, resourcename)
 
 	uri := createRequestURI(apiVersion, apiResource.Name, namespace, apiResource.Namespaced)
+
 	result := r.RESTClient.Post().
 		RequestURI(uri).
 		Body([]byte(rt)).
 		SetHeader("Content-Type", "application/json").
 		Do()
 	if result.Error() != nil {
-		return result.Error()
+		return nil, result.Error()
 	}
-	return nil
+	return &result, nil
 }
 
 // findAPIResource returns the APIResource definition using the discovery client.
 func findAPIResource(discoveryClient discoveryclient.DiscoveryInterface, apiVersion, kind string) (*metav1.APIResource, error) {
 	resourceList, err := discoveryClient.ServerResourcesForGroupVersion(apiVersion)
+
 	if err != nil {
 		return nil, xerrors.Errorf("Error getting kubernetes server resources for apiVersion %s: %s", apiVersion, err)
 	}
@@ -241,4 +315,58 @@ func addLabels(rt json.RawMessage, labels map[string]string) (json.RawMessage, e
 		}
 	}
 	return rt, err
+}
+
+func getPipelineNameFromTriggerTemplate(tt *triggersv1.TriggerTemplate) string{
+	var retStr string
+	for _, resourceTemplate := range tt.Spec.ResourceTemplates {
+		pr := &v1alpha1.PipelineRun{}
+		err := json.Unmarshal(resourceTemplate.RawMessage, pr)
+		if err != nil{
+			return ""
+		}
+		if pr.Kind == "PipelineRun"{
+			retStr = pr.Spec.PipelineRef.Name
+		}
+	}
+	return retStr
+}
+
+func getPipelineTasks(pipeline *v1alpha1.Pipeline)[]string{
+	var retStrs []string
+	for _, task := range pipeline.Spec.Tasks {
+		retStrs = append(retStrs, task.Name)
+	}
+	sort.Reverse(sort.StringSlice(retStrs))
+	return retStrs
+}
+
+func getAccessToken(ki kubernetes.Interface, listener *triggersv1.EventListener, ns string, log *zap.SugaredLogger)string{
+	serviceAccount, err := ki.CoreV1().ServiceAccounts(ns).Get(listener.Spec.ServiceAccountName, metav1.GetOptions{})
+	if err != nil{
+		log.Error(err)
+		return ""
+	}
+	for _, secret := range serviceAccount.Secrets {
+		secret, err := ki.CoreV1().Secrets(ns).Get(secret.Name, metav1.GetOptions{})
+		if err != nil{
+			log.Error(err)
+			return ""
+		}
+		for key, bytes := range secret.Data {
+			if strings.Contains(key, GithubAccessTokenSecretKey){
+				return string(bytes)
+			}
+		}
+	}
+	return ""
+}
+
+func getGithubInfoFromPayload(payload []byte) (repoName , orgName, commitId string){
+	wp := &githubsuites.WebHookPayload{}
+	err := json.Unmarshal(payload, wp)
+	if err == nil {
+		return *wp.Repo.Name, strings.Split(*wp.Repo.FullName, "/")[0], *wp.After
+	}
+	return "", "", ""
 }
