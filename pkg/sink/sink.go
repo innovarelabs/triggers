@@ -23,6 +23,7 @@ import (
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1alpha1"
 	"go.opencensus.io/trace"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"knative.dev/pkg/apis"
 
 	"io/ioutil"
 
@@ -61,13 +62,7 @@ import (
 const (
 	interval = 1 * time.Second
 	timeout  = 10 * time.Minute
-
 	PipelineLabelInjectedKey  = "app"
-	GithubAccessTokenSecretKey = "accessToken"
-	RepoStatusPending = "pending"
-	RepoStatusSuccess = "success"
-	RepoStatusError = "error"
-	RepoStatusFailure = "failure"
 	)
 // Sink defines the sink resource for processing incoming events for the
 // EventListener.
@@ -112,13 +107,14 @@ func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 	var repoName, orgName, commitSha string
 	for _, t := range el.Spec.Triggers {
 		log := eventLog.With(zap.String(triggersv1.TriggerLabelKey, t.Name))
-
+		isGithubEvent := false
 		var interceptor interceptors.Interceptor
 		if t.Interceptor != nil {
 			switch {
 			case t.Interceptor.Webhook != nil:
 				interceptor = webhook.NewInterceptor(t.Interceptor.Webhook, r.HTTPClient, r.EventListenerNamespace, log)
 			case t.Interceptor.Github != nil:
+				isGithubEvent = true
 				interceptor = github.NewInterceptor(t.Interceptor.Github, r.KubeClientSet, r.EventListenerNamespace, log)
 			case t.Interceptor.Gitlab != nil:
 				interceptor = gitlab.NewInterceptor(t.Interceptor.Gitlab, r.KubeClientSet, r.EventListenerNamespace, log)
@@ -126,6 +122,7 @@ func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 		}
 		go func(t triggersv1.EventListenerTrigger) {
 			finalPayload := event
+
 			if interceptor != nil {
 				payload, err := interceptor.ExecuteTrigger(event, request, &t, eventID)
 
@@ -146,17 +143,6 @@ func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 				return
 			}
 
-			pipeline, err := r.PipelineClient.TektonV1alpha1().Pipelines(
-				r.EventListenerNamespace).Get(getPipelineNameFromTriggerTemplate(rt.TriggerTemplate),
-					metav1.GetOptions{})
-			accessToken := getAccessToken(r.KubeClientSet,el, r.EventListenerNamespace, log)
-			github.PostGithubStatusChecks(
-				context.Background(),
-				accessToken,
-				RepoStatusPending,
-				orgName, repoName, commitSha,
-				getPipelineTasks(pipeline), log)
-
 			params, err := template.ResolveParams(rt.TriggerBindings, finalPayload, request.Header, rt.TriggerTemplate.Spec.Params)
 			if err != nil {
 				//log.Errorf("err ======> %+v\n", err)
@@ -166,16 +152,30 @@ func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 			log.Info("params: %+v", params)
 			resources := template.ResolveResources(rt.TriggerTemplate, params)
 			res, err := r.createResources(resources, t.Name, eventID, repoName)
-			if  err != nil {
+			if err != nil {
 				log.Error(err)
 			}
 			result <- http.StatusCreated
-			a, err := res.Raw()
-			err = json.Unmarshal(a, pipelineRun)
-			//fmt.Printf("===========> %v\n",PipelineRunSucceed(pipelineRun.Name))
+			if isGithubEvent{
+				pipeline, err := r.PipelineClient.TektonV1alpha1().Pipelines(
+					r.EventListenerNamespace).Get(getPipelineNameFromTriggerTemplate(rt.TriggerTemplate),
+					metav1.GetOptions{})
+				if err != nil {
+					log.Error(err)
+				}
+				accessToken := getAccessToken(r.KubeClientSet, el, r.EventListenerNamespace, log)
+				github.PostGithubStatusChecks(
+					context.Background(),
+					accessToken,
+					github.RepoStatusPending,
+					orgName, repoName, commitSha,
+					getPipelineTasks(pipeline), log)
 
-			waitForPipelineState(context.Background(), &r, pipelineRun.Name, accessToken,
-				orgName, repoName, commitSha, log)
+				a, err := res.Raw()
+				err = json.Unmarshal(a, pipelineRun)
+				err = waitForPipelineState(context.Background(), &r, pipelineRun.Name, accessToken,
+					orgName, repoName, commitSha, log)
+			}
 		}(t)
 	}
 
@@ -333,7 +333,7 @@ func getAccessToken(ki kubernetes.Interface, listener *triggersv1.EventListener,
 			return ""
 		}
 		for key, bytes := range secret.Data {
-			if strings.Contains(key, GithubAccessTokenSecretKey){
+			if strings.Contains(key, github.RepoAccessTokenSecretKey){
 				return string(bytes)
 			}
 		}
@@ -361,15 +361,20 @@ func waitForPipelineState(ctx context.Context,r *Sink, prName, accessToken, orgN
 				var tasks []string
 				for _, status := range ret.Status.TaskRuns {
 					tasks = append(tasks, status.PipelineTaskName)
-					fmt.Printf("status PipelineTaskName  ==============> %+v\n", status.PipelineTaskName)
-					fmt.Printf("status Reason ==============> %+v\n", status.Status.Conditions[0].Reason)
-					fmt.Printf("status isTure ==============> %+v\n", status.Status.Conditions[0].IsTrue())
-					fmt.Printf("status isFalse ==============> %+v\n", status.Status.Conditions[0].IsFalse())
-					//ctx context.Context, ghAccessToken, status, orgName, repoName, commitSha string, tasksToRestrict []string
 
+					// pending, success, error, or failure.
+					if status.Status.Conditions[0].Reason == string(apis.ConditionSucceeded) {
+						_, err = github.SetupGithubStatusCheck(ctx, accessToken, github.RepoStatusSuccess, orgName, repoName,
+							commitSha,
+							"http://aa403e46c178411eabeeb0624e1247e2-1894439788.us-west-2.elb.amazonaws.com:9097/#/namespaces/test/pipelineruns",
+							[]string{status.PipelineTaskName})
+					}else{
+						_, err = github.SetupGithubStatusCheck(ctx, accessToken, github.RepoStatusFailure, orgName, repoName,
+							commitSha,
+							"http://aa403e46c178411eabeeb0624e1247e2-1894439788.us-west-2.elb.amazonaws.com:9097/#/namespaces/test/pipelineruns",
+							[]string{status.PipelineTaskName})
+					}
 				}
-				// pending, success, error, or failure.
-				_, err = github.SetupGithubStatusCheck(ctx, accessToken, "success", orgName, repoName, commitSha, tasks)
 				//log.Errorf("Error ======> %v\n", err)
 				return true, err
 			}

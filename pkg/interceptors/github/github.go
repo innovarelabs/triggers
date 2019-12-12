@@ -35,6 +35,11 @@ import (
 
 const (
 	GithubBranchToProtect = "master"
+	RepoAccessTokenSecretKey = "accessToken"
+	RepoStatusPending = "pending"
+	RepoStatusSuccess = "success"
+	RepoStatusError = "error"
+	RepoStatusFailure = "failure"
 )
 
 type Interceptor struct {
@@ -93,7 +98,7 @@ func PostGithubStatusChecks(ctx context.Context, ghAccessToken, status, orgName,
 	client, err := SetupGithubStatusCheck(ctx,
 		ghAccessToken,
 		status,
-		orgName, repoName,commitSha,
+		orgName, repoName,commitSha, "",
 		tasksToRestrict)
 	if err != nil {
 		log.Errorf("err ======> %+v\n", err)
@@ -114,7 +119,7 @@ func PostGithubStatusChecks(ctx context.Context, ghAccessToken, status, orgName,
 	}
 }
 
-func SetupGithubStatusCheck(ctx context.Context, ghAccessToken, status, orgName, repoName, commitSha string, tasksToRestrict []string) (*gh.Client, error){
+func SetupGithubStatusCheck(ctx context.Context, ghAccessToken, status, orgName, repoName, commitSha, targetUrl string, tasksToRestrict []string) (*gh.Client, error){
 	ts := oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: ghAccessToken},
 	)
@@ -124,6 +129,7 @@ func SetupGithubStatusCheck(ctx context.Context, ghAccessToken, status, orgName,
 		rs := &gh.RepoStatus{
 			Context: &taskName,
 			State:   &[]string{status}[0],
+			TargetURL: &[]string{targetUrl}[0],
 		}
 		//TODO - Need to add check if the value are empty
 		_, _, err := client.Repositories.CreateStatus(ctx, orgName, repoName, commitSha, rs)
